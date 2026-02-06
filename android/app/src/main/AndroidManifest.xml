@@ -4,8 +4,8 @@
     <application
         android:label="ADB Manager"
         android:name="${applicationName}"
-        android:icon="@drawable/ic_launcher"
-        android:roundIcon="@drawable/ic_launcher">
+        android:icon="@drawable/espada"
+        android:roundIcon="@drawable/espada">
         <activity
             android:name="com.lozanoth.adbmanager.MainActivity"
             android:exported="true"
