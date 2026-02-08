@@ -2,45 +2,62 @@ name: Android Release (Unsigned)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     env:
       DART_DISABLE_WATCHER: "1"
-      GRADLE_OPTS: "-Dorg.gradle.jvmargs='-Xmx4096m -Dfile.encoding=UTF-8'"
-      JAVA_TOOL_OPTIONS: "-XX:MaxMetaspaceSize=512m"
+      GRADLE_OPTS: "-Dorg.gradle.vfs.watch=false"
+      JAVA_TOOL_OPTIONS: "-Xmx4g -XX:MaxMetaspaceSize=1g"
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
+          distribution: temurin
           java-version: "17"
 
-      - name: Set up Flutter
+      - name: Set up Flutter (stable)
         uses: subosito/flutter-action@v2
         with:
-          channel: "stable"
+          channel: stable
+          cache: true
 
-      - name: Pub get
-        run: flutter pub get
+      - name: Cache Flutter Pub
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
 
-      - name: Flutter clean
-        run: flutter clean
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
-      - name: Pub get (after clean)
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager "cmake;3.22.1"
+
+      - name: Flutter pub get
         run: flutter pub get
 
       - name: Build APK (release)
-        run: flutter build apk --release
+        run: flutter build apk --release --split-debug-info=build/debug-info
 
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: adb-manager-release-apk
