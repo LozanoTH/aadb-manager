@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      DART_DISABLE_WATCHER: "1"
+      GRADLE_OPTS: "-Dorg.gradle.jvmargs='-Xmx4096m -Dfile.encoding=UTF-8'"
+      JAVA_TOOL_OPTIONS: "-XX:MaxMetaspaceSize=512m"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,23 +29,15 @@ jobs:
           channel: "stable"
 
       - name: Pub get
-        env:
-          DART_DISABLE_WATCHER: "1"
         run: flutter pub get
 
       - name: Flutter clean
-        env:
-          DART_DISABLE_WATCHER: "1"
         run: flutter clean
 
       - name: Pub get (after clean)
-        env:
-          DART_DISABLE_WATCHER: "1"
         run: flutter pub get
 
       - name: Build APK (release)
-        env:
-          DART_DISABLE_WATCHER: "1"
         run: flutter build apk --release
 
       - name: Upload APK
