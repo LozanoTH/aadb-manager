@@ -1,11 +1,13 @@
 ﻿
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive_io.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -25,10 +27,17 @@ class MyApp extends StatelessWidget {
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF1ED760),
+          brightness: Brightness.light,
+        ),
+      ),
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF1ED760),
           brightness: Brightness.dark,
         ),
-        scaffoldBackgroundColor: const Color(0xFF0B0F14),
       ),
+      themeMode: ThemeMode.system,
       home: const MagiskHome(),
     );
   }
@@ -45,6 +54,18 @@ class ModuleEntry {
     required this.dir,
     required this.mainScript,
     required this.uninstallScript,
+  });
+}
+
+class OnlineModule {
+  final String name;
+  final String description;
+  final String zipUrl;
+
+  const OnlineModule({
+    required this.name,
+    required this.description,
+    required this.zipUrl,
   });
 }
 
@@ -79,6 +100,10 @@ class _MagiskHomeState extends State<MagiskHome> {
   BuildContext? _logSheetContext;
   bool _logSheetOpen = false;
   bool _showInstallLogs = false;
+  final List<OnlineModule> _onlineModules = [];
+  bool _onlineBusy = false;
+  String? _onlineError;
+  String _onlineQuery = '';
 
   @override
   void initState() {
@@ -88,6 +113,7 @@ class _MagiskHomeState extends State<MagiskHome> {
         .listen(_handleLogEvent, onError: _handleLogError);
     _refreshShizukuStatus();
     _loadModules();
+    _loadOnlineModules();
   }
 
   @override
@@ -289,6 +315,52 @@ class _MagiskHomeState extends State<MagiskHome> {
     }
   }
 
+  Future<void> _installModuleFromUrl(OnlineModule module) async {
+    try {
+      setState(() {
+        _onlineBusy = true;
+        _onlineError = null;
+      });
+      final response = await http.get(Uri.parse(module.zipUrl));
+      if (response.statusCode != 200) {
+        throw StateError('HTTP ${response.statusCode}');
+      }
+      final archive = ZipDecoder().decodeBytes(response.bodyBytes);
+      final root = await _modulesRoot();
+      final moduleName = _sanitizeName(module.name);
+      final targetDir = Directory(p.join(root.path, moduleName));
+      if (await targetDir.exists()) {
+        await targetDir.delete(recursive: true);
+      }
+      await targetDir.create(recursive: true);
+
+      for (final file in archive) {
+        final filename = file.name;
+        if (file.isFile) {
+          final outFile = File(p.join(targetDir.path, filename));
+          await outFile.parent.create(recursive: true);
+          await outFile.writeAsBytes(file.content as List<int>);
+        } else {
+          await Directory(p.join(targetDir.path, filename))
+              .create(recursive: true);
+        }
+      }
+
+      await _loadModules();
+      _appendLog('Módulo instalado: ${module.name}');
+    } catch (e) {
+      setState(() {
+        _onlineError = 'Error al descargar ${module.name}: $e';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _onlineBusy = false;
+        });
+      }
+    }
+  }
+
   Future<void> _runModuleScript(ModuleEntry module, String? scriptPath) async {
     if (scriptPath == null) {
       _appendLog('No se encontró el script para ${module.name}.');
@@ -352,6 +424,70 @@ class _MagiskHomeState extends State<MagiskHome> {
     });
   }
 
+  String _sanitizeName(String name) {
+    final cleaned = name.trim().replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    return cleaned.isEmpty ? 'module' : cleaned;
+  }
+
+  Future<void> _loadOnlineModules() async {
+    if (_onlineBusy) return;
+    setState(() {
+      _onlineBusy = true;
+      _onlineError = null;
+    });
+    try {
+      final uri = Uri.parse(
+        'https://raw.githubusercontent.com/LozanoTH/modulos-adb-manager/refs/heads/main/modules.json',
+      );
+      final response = await http.get(uri);
+      if (response.statusCode != 200) {
+        throw StateError('HTTP ${response.statusCode}');
+      }
+      final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      final items = (decoded is List)
+          ? decoded
+          : (decoded is Map && decoded['modules'] is List)
+              ? decoded['modules'] as List
+              : <dynamic>[];
+      final modules = <OnlineModule>[];
+      for (final item in items) {
+        if (item is Map) {
+          final name = (item['name'] ?? item['title'] ?? '').toString();
+          final desc = (item['description'] ?? item['desc'] ?? '')
+              .toString();
+          final url =
+              (item['zip_url'] ?? item['url'] ?? item['zip'] ?? '').toString();
+          if (name.isNotEmpty && url.isNotEmpty) {
+            modules.add(
+              OnlineModule(
+                name: name,
+                description: desc,
+                zipUrl: url,
+              ),
+            );
+          }
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _onlineModules
+          ..clear()
+          ..addAll(modules);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _onlineError = 'No se pudo cargar: $e';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _onlineBusy = false;
+        });
+      }
+    }
+  }
+
   void _openRunLogSheet() {
     if (_logSheetOpen || !mounted) return;
     _logSheetOpen = true;
@@ -398,7 +534,8 @@ class _MagiskHomeState extends State<MagiskHome> {
                 ),
                 const SizedBox(height: 12),
                 _StatusCard(
-                  adbReady: _shizukuAvailable && _shizukuGranted,
+                  adbReady:
+                      _shizukuAvailable && _shizukuGranted && !_shizukuPreV11,
                   uid: _shizukuUid,
                   modulesCount: _modules.length,
                 ),
@@ -474,6 +611,127 @@ class _MagiskHomeState extends State<MagiskHome> {
     );
   }
 
+  Widget _buildOnlineView() {
+    final filteredModules = _onlineQuery.trim().isEmpty
+        ? _onlineModules
+        : _onlineModules
+            .where((m) =>
+                m.name.toLowerCase().contains(_onlineQuery.toLowerCase()) ||
+                m.description
+                    .toLowerCase()
+                    .contains(_onlineQuery.toLowerCase()))
+            .toList();
+    return CustomScrollView(
+      slivers: [
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _TopBar(),
+                const SizedBox(height: 24),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Módulos online',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ),
+                    OutlinedButton(
+                      onPressed: _onlineBusy ? null : _loadOnlineModules,
+                      child: const Text('Refrescar'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  onChanged: (value) {
+                    setState(() {
+                      _onlineQuery = value;
+                    });
+                  },
+                  decoration: InputDecoration(
+                    hintText: 'Buscar módulos...',
+                    prefixIcon: const Icon(Icons.search),
+                    filled: true,
+                    fillColor: Theme.of(context).colorScheme.surfaceVariant,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(
+                        color: Theme.of(context).colorScheme.outlineVariant,
+                      ),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(
+                        color: Theme.of(context).colorScheme.outlineVariant,
+                      ),
+                    ),
+                  ),
+                ),
+                if (_onlineError != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _onlineError!,
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: const Color(0xFFFF6B6B)),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        if (_onlineBusy)
+          const SliverToBoxAdapter(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          )
+        else if (filteredModules.isEmpty)
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Center(
+                child: Text(
+                  'No hay módulos disponibles.',
+                  style: Theme.of(context)
+                      .textTheme
+                      .bodyMedium
+                      ?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                ),
+              ),
+            ),
+          )
+        else
+          SliverPadding(
+            padding: const EdgeInsets.symmetric(horizontal: 20),
+            sliver: SliverList(
+              delegate: SliverChildBuilderDelegate(
+                (context, index) {
+                  final module = filteredModules[index];
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: _OnlineModuleCard(
+                      module: module,
+                      busy: _onlineBusy,
+                      onInstall: () => _installModuleFromUrl(module),
+                    ),
+                  );
+                },
+                childCount: filteredModules.length,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
   Widget _buildPlaceholderView(String title, String subtitle) {
     return CustomScrollView(
       slivers: [
@@ -497,7 +755,9 @@ class _MagiskHomeState extends State<MagiskHome> {
                   style: Theme.of(context)
                       .textTheme
                       .bodyMedium
-                      ?.copyWith(color: Colors.white70),
+                      ?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                 ),
               ],
             ),
@@ -541,9 +801,11 @@ class _MagiskHomeState extends State<MagiskHome> {
                 Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF121923),
+                    color: Theme.of(context).colorScheme.surface,
                     borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: const Color(0xFF253042)),
+                    border: Border.all(
+                      color: Theme.of(context).colorScheme.outlineVariant,
+                    ),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -560,7 +822,10 @@ class _MagiskHomeState extends State<MagiskHome> {
                         style: Theme.of(context)
                             .textTheme
                             .bodyMedium
-                            ?.copyWith(color: Colors.white70),
+                            ?.copyWith(
+                              color:
+                                  Theme.of(context).colorScheme.onSurfaceVariant,
+                            ),
                       ),
                       const SizedBox(height: 4),
                       Text(
@@ -568,7 +833,10 @@ class _MagiskHomeState extends State<MagiskHome> {
                         style: Theme.of(context)
                             .textTheme
                             .bodySmall
-                            ?.copyWith(color: Colors.white70),
+                            ?.copyWith(
+                              color:
+                                  Theme.of(context).colorScheme.onSurfaceVariant,
+                            ),
                       ),
                     ],
                   ),
@@ -593,6 +861,7 @@ class _MagiskHomeState extends State<MagiskHome> {
               children: [
                 _buildHomeView(),
                 _buildModulesView(),
+                _buildOnlineView(),
                 _buildSettingsView(),
               ],
             ),
@@ -620,10 +889,13 @@ class _BackgroundGlow extends StatelessWidget {
           child: Container(
             width: 260,
             height: 260,
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               shape: BoxShape.circle,
               gradient: RadialGradient(
-                colors: [Color(0x551ED760), Colors.transparent],
+                colors: [
+                  Theme.of(context).colorScheme.primary.withOpacity(0.25),
+                  Colors.transparent
+                ],
               ),
             ),
           ),
@@ -634,10 +906,13 @@ class _BackgroundGlow extends StatelessWidget {
           child: Container(
             width: 320,
             height: 320,
-            decoration: const BoxDecoration(
+            decoration: BoxDecoration(
               shape: BoxShape.circle,
               gradient: RadialGradient(
-                colors: [Color(0x444FC3F7), Colors.transparent],
+                colors: [
+                  Theme.of(context).colorScheme.secondary.withOpacity(0.2),
+                  Colors.transparent
+                ],
               ),
             ),
           ),
@@ -656,11 +931,16 @@ class _TopBar extends StatelessWidget {
           width: 40,
           height: 40,
           decoration: BoxDecoration(
-            color: const Color(0xFF1B2330),
+            color: Theme.of(context).colorScheme.surfaceVariant,
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: const Color(0xFF2B3646)),
+            border: Border.all(
+              color: Theme.of(context).colorScheme.outlineVariant,
+            ),
           ),
-          child: const Icon(Icons.shield_outlined, color: Color(0xFF1ED760)),
+          child: Icon(
+            Icons.shield_outlined,
+            color: Theme.of(context).colorScheme.primary,
+          ),
         ),
         const SizedBox(width: 12),
         Column(
@@ -676,7 +956,7 @@ class _TopBar extends StatelessWidget {
             Text(
               'v28.2 (28000) · Stable',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Colors.white70,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
             ),
           ],
@@ -707,14 +987,16 @@ class _StatusCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF121923),
+        color: Theme.of(context).colorScheme.surface,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFF253042)),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.35),
-            blurRadius: 20,
-            offset: const Offset(0, 12),
+            color: Colors.black.withOpacity(0.08),
+            blurRadius: 16,
+            offset: const Offset(0, 8),
           )
         ],
       ),
@@ -725,11 +1007,13 @@ class _StatusCard extends StatelessWidget {
               Container(
                 padding: const EdgeInsets.all(10),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF1B2330),
+                  color: Theme.of(context).colorScheme.surfaceVariant,
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: const Icon(Icons.verified_outlined,
-                    color: Color(0xFF1ED760)),
+                child: Icon(
+                  Icons.verified_outlined,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -746,13 +1030,14 @@ class _StatusCard extends StatelessWidget {
                     Text(
                       'Conexión ADB/Shizuku e identidad de shell',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: Colors.white70,
+                            color:
+                                Theme.of(context).colorScheme.onSurfaceVariant,
                           ),
                     ),
                   ],
                 ),
               ),
-              const _TogglePill(),
+              _TogglePill(active: adbReady),
             ],
           ),
           const SizedBox(height: 16),
@@ -825,9 +1110,11 @@ class _ShizukuCard extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF121923),
+        color: Theme.of(context).colorScheme.surface,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFF253042)),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -857,7 +1144,8 @@ class _ShizukuCard extends StatelessWidget {
                     Text(
                       detail,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: Colors.white70,
+                            color:
+                                Theme.of(context).colorScheme.onSurfaceVariant,
                           ),
                     ),
                   ],
@@ -870,7 +1158,7 @@ class _ShizukuCard extends StatelessWidget {
             Text(
               error!,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: const Color(0xFFFF6B6B),
+                    color: Theme.of(context).colorScheme.error,
                   ),
             ),
           ],
@@ -957,7 +1245,7 @@ class _ModulesGrid extends StatelessWidget {
               style: Theme.of(context)
                   .textTheme
                   .bodyMedium
-                  ?.copyWith(color: Colors.white70),
+                  ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
             ),
           ),
         ),
@@ -1002,20 +1290,25 @@ class _ModuleCard extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12),
         decoration: BoxDecoration(
-          color: const Color(0xFF121923),
+          color: Theme.of(context).colorScheme.surface,
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: const Color(0xFF253042)),
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
         ),
         child: Row(
           children: [
             Container(
               padding: const EdgeInsets.all(8),
               decoration: BoxDecoration(
-                color: const Color(0xFF1ED760).withOpacity(0.15),
+                color:
+                    Theme.of(context).colorScheme.primary.withOpacity(0.15),
                 borderRadius: BorderRadius.circular(12),
               ),
-              child:
-                  const Icon(Icons.widgets_outlined, color: Color(0xFF1ED760)),
+              child: Icon(
+                Icons.widgets_outlined,
+                color: Theme.of(context).colorScheme.primary,
+              ),
             ),
             const SizedBox(width: 10),
             Expanded(
@@ -1057,9 +1350,11 @@ class _LogsPanel extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF0F151E),
+        color: Theme.of(context).colorScheme.surface,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFF253042)),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1083,9 +1378,11 @@ class _LogsPanel extends StatelessWidget {
             padding: const EdgeInsets.all(12),
             constraints: const BoxConstraints(minHeight: 120, maxHeight: 220),
             decoration: BoxDecoration(
-              color: const Color(0xFF0B0F14),
+              color: Theme.of(context).colorScheme.surfaceVariant,
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: const Color(0xFF1D2633)),
+              border: Border.all(
+                color: Theme.of(context).colorScheme.outlineVariant,
+              ),
             ),
             child: SingleChildScrollView(
               reverse: true,
@@ -1095,7 +1392,7 @@ class _LogsPanel extends StatelessWidget {
                   fontFamily: 'monospace',
                   fontSize: 12,
                   height: 1.4,
-                  color: Colors.white70,
+                  color: Colors.black87,
                 ),
               ),
             ),
@@ -1118,9 +1415,11 @@ class _RunLogSheet extends StatelessWidget {
         margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: const Color(0xFF0F151E),
+          color: Theme.of(context).colorScheme.surface,
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(color: const Color(0xFF253042)),
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -1128,7 +1427,10 @@ class _RunLogSheet extends StatelessWidget {
           children: [
             Row(
               children: [
-                const Icon(Icons.terminal, color: Color(0xFF1ED760)),
+                Icon(
+                  Icons.terminal,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
                 const SizedBox(width: 8),
                 Text(
                   'Ejecución en curso',
@@ -1142,9 +1444,11 @@ class _RunLogSheet extends StatelessWidget {
               constraints: const BoxConstraints(maxHeight: 260),
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
-                color: const Color(0xFF0B0F14),
+                color: Theme.of(context).colorScheme.surfaceVariant,
                 borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFF1D2633)),
+                border: Border.all(
+                  color: Theme.of(context).colorScheme.outlineVariant,
+                ),
               ),
               child: ValueListenableBuilder<List<String>>(
                 valueListenable: logs,
@@ -1157,7 +1461,7 @@ class _RunLogSheet extends StatelessWidget {
                         fontFamily: 'monospace',
                         fontSize: 12,
                         height: 1.4,
-                        color: Colors.white70,
+                        color: Colors.black87,
                       ),
                     ),
                   );
@@ -1167,22 +1471,82 @@ class _RunLogSheet extends StatelessWidget {
             const SizedBox(height: 12),
             Row(
               children: [
-                const SizedBox(
+                SizedBox(
                   width: 16,
                   height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
                 ),
                 const SizedBox(width: 8),
                 Text(
                   'Ejecutando...',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: Colors.white70,
+                        color:
+                            Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                 ),
               ],
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _OnlineModuleCard extends StatelessWidget {
+  final OnlineModule module;
+  final VoidCallback onInstall;
+  final bool busy;
+
+  const _OnlineModuleCard({
+    required this.module,
+    required this.onInstall,
+    required this.busy,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            module.name,
+            style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+          ),
+          if (module.description.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              module.description,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
+            ),
+          ],
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton.icon(
+              onPressed: busy ? null : onInstall,
+              icon: const Icon(Icons.download_outlined),
+              label: const Text('Instalar'),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1201,9 +1565,11 @@ class _StatusMetric extends StatelessWidget {
         margin: const EdgeInsets.symmetric(horizontal: 4),
         padding: const EdgeInsets.symmetric(vertical: 12),
         decoration: BoxDecoration(
-          color: const Color(0xFF0D141D),
+          color: Theme.of(context).colorScheme.surfaceVariant,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: const Color(0xFF243041)),
+          border: Border.all(
+            color: Theme.of(context).colorScheme.outlineVariant,
+          ),
         ),
         child: Column(
           children: [
@@ -1211,14 +1577,14 @@ class _StatusMetric extends StatelessWidget {
               value,
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w700,
-                    color: const Color(0xFF1ED760),
+                    color: Theme.of(context).colorScheme.primary,
                   ),
             ),
             const SizedBox(height: 4),
             Text(
               label,
               style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                    color: Colors.white70,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
             ),
           ],
@@ -1229,25 +1595,33 @@ class _StatusMetric extends StatelessWidget {
 }
 
 class _TogglePill extends StatelessWidget {
-  const _TogglePill();
+  final bool active;
+
+  const _TogglePill({required this.active});
 
   @override
   Widget build(BuildContext context) {
+    final color = active
+        ? Theme.of(context).colorScheme.primary
+        : Theme.of(context).colorScheme.error;
+    final bgColor = active
+        ? Theme.of(context).colorScheme.primaryContainer
+        : Theme.of(context).colorScheme.errorContainer;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       decoration: BoxDecoration(
-        color: const Color(0xFF0B1A12),
+        color: bgColor,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: const Color(0xFF1ED760)),
+        border: Border.all(color: color),
       ),
       child: Row(
-        children: const [
-          Icon(Icons.power_settings_new, size: 16, color: Color(0xFF1ED760)),
-          SizedBox(width: 6),
+        children: [
+          Icon(Icons.power_settings_new, size: 16, color: color),
+          const SizedBox(width: 6),
           Text(
-            'Activo',
+            active ? 'Activo' : 'Inactivo',
             style: TextStyle(
-              color: Color(0xFF1ED760),
+              color: color,
               fontWeight: FontWeight.w700,
             ),
           ),
@@ -1275,9 +1649,11 @@ class _ActionTile extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: const Color(0xFF121923),
+        color: Theme.of(context).colorScheme.surface,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFF253042)),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1301,7 +1677,7 @@ class _ActionTile extends StatelessWidget {
           Text(
             subtitle,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Colors.white70,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
                 ),
           ),
         ],
@@ -1363,9 +1739,11 @@ class _QuickButton extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 14),
           decoration: BoxDecoration(
-            color: const Color(0xFF121923),
+            color: Theme.of(context).colorScheme.surface,
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: const Color(0xFF253042)),
+            border: Border.all(
+              color: Theme.of(context).colorScheme.outlineVariant,
+            ),
           ),
           child: Column(
             children: [
@@ -1400,9 +1778,11 @@ class _BottomNavBar extends StatelessWidget {
       margin: const EdgeInsets.fromLTRB(20, 0, 20, 16),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
-        color: const Color(0xFF0F151E),
+        color: Theme.of(context).colorScheme.surface,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: const Color(0xFF253042)),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+        ),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -1420,10 +1800,16 @@ class _BottomNavBar extends StatelessWidget {
             onTap: () => onTap(1),
           ),
           _NavItem(
-            icon: Icons.settings_outlined,
-            label: 'Ajustes',
+            icon: Icons.cloud_download_outlined,
+            label: 'Online',
             active: currentIndex == 2,
             onTap: () => onTap(2),
+          ),
+          _NavItem(
+            icon: Icons.settings_outlined,
+            label: 'Ajustes',
+            active: currentIndex == 3,
+            onTap: () => onTap(3),
           ),
         ],
       ),
@@ -1446,7 +1832,9 @@ class _NavItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final color = active ? const Color(0xFF1ED760) : Colors.white70;
+    final color = active
+        ? Theme.of(context).colorScheme.primary
+        : Theme.of(context).colorScheme.onSurfaceVariant;
     return Expanded(
       child: InkWell(
         onTap: onTap,
