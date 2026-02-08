@@ -25,9 +25,23 @@ jobs:
           channel: "stable"
 
       - name: Pub get
+        env:
+          DART_DISABLE_WATCHER: "1"
+        run: flutter pub get
+
+      - name: Flutter clean
+        env:
+          DART_DISABLE_WATCHER: "1"
+        run: flutter clean
+
+      - name: Pub get (after clean)
+        env:
+          DART_DISABLE_WATCHER: "1"
         run: flutter pub get
 
       - name: Build APK (release)
+        env:
+          DART_DISABLE_WATCHER: "1"
         run: flutter build apk --release
 
       - name: Upload APK
