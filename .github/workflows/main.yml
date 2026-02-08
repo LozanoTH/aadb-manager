@@ -47,10 +47,6 @@ jobs:
           restore-keys: |
             gradle-${{ runner.os }}-
 
-      - name: Install Android SDK components
-        run: |
-          yes | sdkmanager "cmake;3.22.1"
-
       - name: Flutter pub get
         run: flutter pub get
 
