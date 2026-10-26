@@ -1,3 +1,6 @@
+[![Licencia](https://img.shields.io/github/license/LozanoTH/aadb-manager)](LICENSE)
+[![Lenguaje](https://img.shields.io/github/languages/top/LozanoTH/aadb-manager)](https://github.com/LozanoTH/aadb-manager)
+
 # ADB Manager
 
 ![Diseño](assets/demo.png)
